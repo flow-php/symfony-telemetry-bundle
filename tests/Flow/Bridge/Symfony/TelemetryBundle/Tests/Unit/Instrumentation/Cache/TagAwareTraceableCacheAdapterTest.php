@@ -6,6 +6,7 @@ namespace Flow\Bridge\Symfony\TelemetryBundle\Tests\Unit\Instrumentation\Cache;
 
 use BadMethodCallException;
 use Flow\Bridge\Symfony\TelemetryBundle\Instrumentation\Cache\TagAwareTraceableCacheAdapter;
+use Flow\Bridge\Symfony\TelemetryBundle\Tests\Mother\TelemetryMother;
 use Flow\Telemetry\Context\MemoryContextStorage;
 use Flow\Telemetry\Logger\LoggerProvider;
 use Flow\Telemetry\Meter\MeterProvider;
@@ -30,6 +31,26 @@ use Symfony\Component\Cache\ResettableInterface;
 #[CoversClass(TagAwareTraceableCacheAdapter::class)]
 final class TagAwareTraceableCacheAdapterTest extends TestCase
 {
+    public function test_emits_no_spans_when_tracing_is_suppressed(): void
+    {
+        $spanProcessor = new MemorySpanProcessor(new MemoryExporter());
+        $adapter = new TagAwareTraceableCacheAdapter(
+            $this->createMock(TagAwareAdapterInterface::class),
+            TelemetryMother::suppressed($spanProcessor),
+            'test.pool',
+        );
+
+        $adapter->clear();
+        $adapter->deleteItem('key');
+        $adapter->save($this->createMock(CacheItemInterface::class));
+
+        static::assertCount(
+            0,
+            $spanProcessor->endedSpans(),
+            'cache instrumentation must emit no spans while tracing is suppressed',
+        );
+    }
+
     public function test_clear_creates_span_with_correct_attributes(): void
     {
         $spanProcessor = new MemorySpanProcessor(new MemoryExporter());
@@ -95,7 +116,7 @@ final class TagAwareTraceableCacheAdapterTest extends TestCase
         static::assertCount(1, $spans);
 
         $span = $spans[0];
-        static::assertSame('Cache Clear test.pool', $span->name());
+        static::assertSame('cache.clear', $span->name());
         static::assertSame(SpanKind::CLIENT, $span->kind());
         static::assertSame('clear', $span->attributes()['cache.operation']);
         static::assertSame('test.pool', $span->attributes()['cache.pool']);
@@ -365,7 +386,7 @@ final class TagAwareTraceableCacheAdapterTest extends TestCase
         static::assertCount(1, $spans);
 
         $span = $spans[0];
-        static::assertSame('Cache InvalidateTags test.pool', $span->name());
+        static::assertSame('cache.invalidate_tags', $span->name());
         static::assertSame(['tag1', 'tag2', 'tag3'], $span->attributes()['cache.tags']);
         static::assertSame(3, $span->attributes()['cache.tag_count']);
     }

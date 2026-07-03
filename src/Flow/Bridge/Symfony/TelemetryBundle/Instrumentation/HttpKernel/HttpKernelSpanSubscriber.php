@@ -14,6 +14,7 @@ use Flow\Telemetry\Context\Scope;
 use Flow\Telemetry\PackageVersion;
 use Flow\Telemetry\Propagation\PropagationContext;
 use Flow\Telemetry\Propagation\Propagator;
+use Flow\Telemetry\SemConvAttributes;
 use Flow\Telemetry\Telemetry;
 use Flow\Telemetry\Tracer\Span;
 use Flow\Telemetry\Tracer\SpanKind;
@@ -41,6 +42,8 @@ final readonly class HttpKernelSpanSubscriber implements EventSubscriberInterfac
     private const string TRACER_ATTRIBUTE = '_flow_telemetry_tracer';
 
     private const string PROPAGATION_SCOPE_ATTRIBUTE = '_flow_telemetry_propagation_scope';
+
+    private const string SUPPRESSION_SCOPE_ATTRIBUTE = '_flow_telemetry_suppression_scope';
 
     /** @var array<PathExclusionRule> */
     private array $excludePathRules;
@@ -90,12 +93,12 @@ final readonly class HttpKernelSpanSubscriber implements EventSubscriberInterfac
         $controllerName = ControllerName::resolve($event->getController())?->name;
 
         if ($controllerName !== null) {
-            $span->setAttribute('controller', $controllerName);
+            $span->setAttribute(HttpKernelAttributes::ATTR_CONTROLLER, $controllerName);
         }
 
         if (is_string($route) && $route !== '') {
             $routeValue = $this->routeValue($route);
-            $span->setAttribute('http.route', $routeValue);
+            $span->setAttribute(SemConvAttributes::HTTP_ROUTE, $routeValue);
             $span->rename("{$request->getMethod()} {$routeValue}");
         } elseif ($controllerName !== null) {
             // Sub-requests (render(controller(...))) carry no route, so name them after the controller.
@@ -131,6 +134,15 @@ final readonly class HttpKernelSpanSubscriber implements EventSubscriberInterfac
         $path = $request->getPathInfo();
 
         if (!$this->shouldTraceByPath($path, $method)) {
+            // Excluding a path must not merely skip its own span: lower-level auto-instrumentation (DBAL,
+            // cache) and app kernel.terminate listeners still run for this request and would otherwise emit
+            // orphan root spans. Suppress tracing for the whole request instead, so the SuppressingSampler
+            // drops every span created until the suppression scope is detached on finish_request/terminate.
+            $request->attributes->set(
+                self::SUPPRESSION_SCOPE_ATTRIBUTE,
+                $this->contextStorage->attach($this->contextStorage->current()->withSuppressedTracing()),
+            );
+
             return;
         }
 
@@ -144,13 +156,28 @@ final readonly class HttpKernelSpanSubscriber implements EventSubscriberInterfac
         // upgrade to "{method} {route}" once the route is resolved (see onController). The raw path stays
         // on the url.path attribute.
         $tracer = $this->telemetry->tracer('flow.symfony.http_kernel', PackageVersion::get('symfony/http-kernel'));
-        $span = $tracer->span($method, $kind, [
-            'http.request.method' => $method,
-            'url.full' => $request->getUri(),
-            'url.path' => $request->getRequestUri(),
-            'url.scheme' => $request->getScheme(),
-            'server.address' => $request->getHost(),
-        ]);
+        $attributes = [
+            SemConvAttributes::HTTP_REQUEST_METHOD => $method,
+            // OTEL HTTP semconv: url.path must not carry the query string; url.query is separate
+            // and url.full is a client-span attribute, so it has no place on a server span.
+            SemConvAttributes::URL_PATH => $request->getPathInfo(),
+            SemConvAttributes::URL_SCHEME => $request->getScheme(),
+            SemConvAttributes::SERVER_ADDRESS => $request->getHost(),
+        ];
+
+        $queryString = $request->server->getString('QUERY_STRING');
+
+        if ($queryString !== '') {
+            $attributes[SemConvAttributes::URL_QUERY] = $queryString;
+        }
+
+        $userAgent = $request->headers->get('User-Agent');
+
+        if ($userAgent !== null && $userAgent !== '') {
+            $attributes[SemConvAttributes::USER_AGENT_ORIGINAL] = $userAgent;
+        }
+
+        $span = $tracer->span($method, $kind, $attributes);
 
         $request->attributes->set(self::SPAN_ATTRIBUTE, $span);
         $request->attributes->set(self::TRACER_ATTRIBUTE, $tracer);
@@ -168,13 +195,13 @@ final readonly class HttpKernelSpanSubscriber implements EventSubscriberInterfac
         $response = $event->getResponse();
         $statusCode = $response->getStatusCode();
 
-        $span->setAttribute('http.response.status_code', $statusCode);
+        $span->setAttribute(SemConvAttributes::HTTP_RESPONSE_STATUS_CODE, $statusCode);
 
         // OTEL HTTP semconv: for SpanKind.SERVER the span status MUST be left unset for 1xx-4xx; only
         // 5xx (or other server-caused failures) is an Error. A 4xx is the client's fault, not the server's.
         if ($statusCode >= 500) {
             $span->setStatus(SpanStatus::error("HTTP {$statusCode}"));
-            $span->setAttribute('error.type', (string) $statusCode);
+            $span->setAttribute(SemConvAttributes::ERROR_TYPE, (string) $statusCode);
         }
 
         if ($event->isMainRequest() && $this->contextPropagation) {
@@ -189,15 +216,28 @@ final readonly class HttpKernelSpanSubscriber implements EventSubscriberInterfac
     public function onFinishRequest(FinishRequestEvent $event): void
     {
         if ($event->isMainRequest()) {
+            // The main request's suppression scope (excluded path) is detached on terminate, below, so it
+            // still covers kernel.terminate listeners; sub-requests never terminate, so they detach here.
             return;
         }
 
         $this->completeSpan($event->getRequest());
+        $this->detachSuppressionScope($event->getRequest());
     }
 
     public function onTerminate(TerminateEvent $event): void
     {
         $this->completeSpan($event->getRequest());
+        $this->detachSuppressionScope($event->getRequest());
+    }
+
+    private function detachSuppressionScope(Request $request): void
+    {
+        // @mago-expect analysis:mixed-assignment
+        if (($scope = $request->attributes->get(self::SUPPRESSION_SCOPE_ATTRIBUTE)) instanceof Scope) {
+            $scope->detach();
+            $request->attributes->remove(self::SUPPRESSION_SCOPE_ATTRIBUTE);
+        }
     }
 
     private function completeSpan(Request $request): void

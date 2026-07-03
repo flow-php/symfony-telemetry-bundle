@@ -13,6 +13,7 @@ use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\CacheTeleme
 use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\ChannelLoggerPass;
 use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\ControllerResolverTelemetryPass;
 use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\DBALTelemetryPass;
+use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\MessengerTelemetryPass;
 use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\FrameworkLoggerPass;
 use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\HttpClientTelemetryPass;
 use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\OTLPAvailabilityPass;
@@ -20,10 +21,9 @@ use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\ProfilerSig
 use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\Psr18ClientTelemetryPass;
 use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\TraceContextUrlGeneratorPass;
 use Flow\Bridge\Symfony\TelemetryBundle\Exception\RuntimeException;
+use Flow\Bridge\Symfony\TelemetryBundle\Instrumentation\Console\CommandSuppressionSubscriber;
 use Flow\Bridge\Symfony\TelemetryBundle\Instrumentation\Console\ConsoleLogOutputSubscriber;
 use Flow\Bridge\Symfony\TelemetryBundle\Instrumentation\HttpKernel\RouteNaming;
-use Flow\Bridge\Symfony\TelemetryBundle\Instrumentation\Messenger\MessengerHandlerLink;
-use Flow\Bridge\Symfony\TelemetryBundle\Instrumentation\Messenger\MessengerMetricDurationUnit;
 use Flow\Bridge\Symfony\TelemetryBundle\Instrumentation\Security\UserSpanAttributeProvider;
 use Flow\Bridge\Symfony\TelemetryBundle\Logger\ConsoleOutputLogProcessor;
 use Flow\Bridge\Symfony\TelemetryBundle\Logger\ConsoleVerbosityLevels;
@@ -60,6 +60,7 @@ use Flow\Telemetry\ErrorHandler\SyslogSeverity;
 use Flow\Telemetry\ErrorHandler\UdpSyslogHandler;
 use Flow\Telemetry\Logger\Logger;
 use Flow\Telemetry\Logger\LoggerProvider;
+use Flow\Telemetry\SemConvAttributes;
 use Flow\Telemetry\Logger\Middleware\AttributeFilteringLogMiddleware;
 use Flow\Telemetry\Logger\Middleware\EnrichingLogMiddleware;
 use Flow\Telemetry\Logger\Middleware\SeverityFilteringLogMiddleware;
@@ -108,6 +109,7 @@ use Flow\Telemetry\Tracer\Sampler\AlwaysOffSampler;
 use Flow\Telemetry\Tracer\Sampler\AlwaysOnSampler;
 use Flow\Telemetry\Tracer\Sampler\AttributeMatchingSampler;
 use Flow\Telemetry\Tracer\Sampler\ParentBasedSampler;
+use Flow\Telemetry\Tracer\Sampler\SuppressingSampler;
 use Flow\Telemetry\Tracer\Sampler\TraceIdRatioBasedSampler;
 use Flow\Telemetry\Tracer\Tracer;
 use Flow\Telemetry\Tracer\TracerProvider;
@@ -213,6 +215,12 @@ final class FlowTelemetryBundle extends AbstractBundle
 
         if (interface_exists(self::CACHE_ADAPTER_INTERFACE)) {
             $container->addCompilerPass(new CacheTelemetryPass());
+        }
+
+        if (interface_exists(self::MESSENGER_MIDDLEWARE_INTERFACE)) {
+            // Must run before Symfony's MessengerPass (BEFORE_OPTIMIZATION, priority 0), which reads the
+            // "<busId>.middleware" parameter this pass prepends to.
+            $container->addCompilerPass(new MessengerTelemetryPass(), PassConfig::TYPE_BEFORE_OPTIMIZATION, 32);
         }
     }
 
@@ -367,7 +375,7 @@ final class FlowTelemetryBundle extends AbstractBundle
             ->end()
             ->enumNode('channel_attribute_target')
             ->info(
-                'Where the "log.channel" attribute of a synthesized channel logger is placed: "scope" (instrumentation scope), "signal" (every emitted record), or "both" (default). Applies to framework-captured and #[WithTelemetryChannel] channels alike.',
+                'Where the "flow.log.channel" attribute of a synthesized channel logger is placed: "scope" (instrumentation scope), "signal" (every emitted record), or "both" (default). Applies to framework-captured and #[WithTelemetryChannel] channels alike.',
             )
             ->values(['scope', 'signal', 'both'])
             ->defaultValue('both')
@@ -588,50 +596,32 @@ final class FlowTelemetryBundle extends AbstractBundle
             ->canBeEnabled()
             ->children()
             ->arrayNode('exclude_commands')
-            ->info('Command names to exclude from tracing (supports regex with / delimiters)')
+            ->info('Command names whose tracing is fully suppressed: the command and every span nested under '
+                . 'it are dropped (supports regex with / delimiters). Instrumentation that starts its own '
+                . 'root trace — e.g. messenger per-message handlers — is unaffected. Honored regardless of '
+                . 'whether console spans are enabled. Set to [] to trace everything (including messenger:consume).')
             ->scalarPrototype()
             ->end()
+            ->defaultValue(['messenger:consume'])
             ->end()
             ->end()
             ->end()
             ->arrayNode('messenger')
             ->info('Messenger tracing configuration')
             ->canBeEnabled()
-            ->validate()
-            ->ifTrue(static function (array $messenger): bool {
-                $trace = $messenger['trace'] ?? 'both';
-                $link = $messenger['link'] ?? 'both';
-                $workerTraced = $trace === 'worker' || $trace === 'both';
-
-                return !$workerTraced && ($link === 'worker' || $link === 'both');
-            })
-            ->thenInvalid('messenger.link cannot be "worker" or "both" unless messenger.trace includes the worker (set messenger.trace to "worker" or "both"), otherwise there is no worker trace to link to.')
-            ->end()
             ->children()
             ->booleanNode('context_propagation')
             ->info('Enable context propagation across message boundaries (requires propagator)')
             ->defaultTrue()
             ->end()
-            ->enumNode('trace')
-            ->info('Which messenger spans to emit: "worker" (the messenger.receive cycle span only), '
-                . '"handlers" (the process/send message spans only), "both" (default), or "none" (no spans; metrics only).')
-            ->values(['worker', 'handlers', 'both', 'none'])
-            ->defaultValue('both')
-            ->end()
-            ->enumNode('link')
-            ->info('Which links the consumed "process" span carries: "dispatcher" (the producing span), '
-                . '"worker" (the messenger.receive cycle span), or "both" (default). "worker"/"both" require worker tracing.')
-            ->values(['dispatcher', 'worker', 'both'])
-            ->defaultValue('both')
+            ->booleanNode('trace')
+            ->info('Emit a per-message span for each consumed/produced message. When false, the worker is fully '
+                . 'suppressed and only metrics are emitted (if metrics are enabled).')
+            ->defaultTrue()
             ->end()
             ->booleanNode('metrics')
             ->info('Emit OTEL messaging metrics for consumed/sent messages (messaging.client.consumed.messages, messaging.client.sent.messages) and processing duration (messaging.process.duration)')
             ->defaultTrue()
-            ->end()
-            ->enumNode('metrics_duration_unit')
-            ->info('Unit for the messaging.process.duration histogram: "s" (OTEL semconv default) or "ms" (Flow-native histogram buckets)')
-            ->values(['s', 'ms'])
-            ->defaultValue('s')
             ->end()
             ->end()
             ->end()
@@ -670,7 +660,7 @@ final class FlowTelemetryBundle extends AbstractBundle
             ->addDefaultsIfNotSet()
             ->children()
             ->booleanNode('enabled')->defaultTrue()->end()
-            ->scalarNode('attribute')->info('Span attribute key')->defaultValue('user.id')->cannotBeEmpty()->end()
+            ->scalarNode('attribute')->info('Span attribute key')->defaultValue(SemConvAttributes::USER_ID)->cannotBeEmpty()->end()
             ->end()
             ->end()
             ->arrayNode('roles')
@@ -678,7 +668,7 @@ final class FlowTelemetryBundle extends AbstractBundle
             ->addDefaultsIfNotSet()
             ->children()
             ->booleanNode('enabled')->defaultFalse()->end()
-            ->scalarNode('attribute')->info('Span attribute key')->defaultValue('user.roles')->cannotBeEmpty()->end()
+            ->scalarNode('attribute')->info('Span attribute key')->defaultValue(SemConvAttributes::USER_ROLES)->cannotBeEmpty()->end()
             ->end()
             ->end()
             ->arrayNode('email')
@@ -686,7 +676,7 @@ final class FlowTelemetryBundle extends AbstractBundle
             ->addDefaultsIfNotSet()
             ->children()
             ->booleanNode('enabled')->defaultFalse()->end()
-            ->scalarNode('attribute')->info('Span attribute key')->defaultValue('user.email')->cannotBeEmpty()->end()
+            ->scalarNode('attribute')->info('Span attribute key')->defaultValue(SemConvAttributes::USER_EMAIL)->cannotBeEmpty()->end()
             ->scalarNode('getter')->info('User method to read the email from')->defaultValue('getEmail')->cannotBeEmpty()->end()
             ->end()
             ->end()
@@ -720,17 +710,41 @@ final class FlowTelemetryBundle extends AbstractBundle
             ->info('Doctrine DBAL query tracing configuration')
             ->canBeEnabled()
             ->children()
-            ->booleanNode('log_sql')
-            ->info('Whether to include SQL in span attributes')
-            ->defaultTrue()
-            ->end()
             ->integerNode('max_sql_length')
             ->info('Maximum SQL length in span attributes (0 = no limit)')
             ->defaultValue(1000)
             ->min(0)
             ->end()
+            ->booleanNode('collect_metrics')
+            ->info('Record db.client.operation.duration and db.client.response.returned_rows histograms')
+            ->defaultTrue()
+            ->end()
+            ->booleanNode('include_parameters')
+            ->info('Include bound statement parameters in span attributes (security consideration)')
+            ->defaultFalse()
+            ->end()
+            ->integerNode('max_parameters')
+            ->info('Maximum number of parameters to include when include_parameters is enabled')
+            ->defaultValue(10)
+            ->min(0)
+            ->end()
+            ->integerNode('max_parameter_length')
+            ->info('Maximum length for each included parameter value')
+            ->defaultValue(100)
+            ->min(0)
+            ->end()
+            ->enumNode('transaction_spans')
+            ->info('How transactions are traced: "grouped" (one BEGIN TRANSACTION span holding the queries), "per_operation" (a short span per BEGIN/COMMIT/ROLLBACK), or "off" (no transaction spans)')
+            ->values(['grouped', 'per_operation', 'off'])
+            ->defaultValue('grouped')
+            ->end()
             ->arrayNode('exclude_connections')
             ->info('Connection names to exclude from tracing (supports regex with / delimiters)')
+            ->scalarPrototype()
+            ->end()
+            ->end()
+            ->arrayNode('exclude_tables')
+            ->info('Table names whose queries are not traced (e.g. "cache_items" behind a Doctrine DBAL cache pool); matched case-insensitively on whole words in the SQL')
             ->scalarPrototype()
             ->end()
             ->end()
@@ -744,6 +758,10 @@ final class FlowTelemetryBundle extends AbstractBundle
             ->info('Cache pool service IDs to exclude from tracing (supports regex with / delimiters)')
             ->scalarPrototype()
             ->end()
+            ->end()
+            ->booleanNode('flush_deferred')
+            ->info('Commit deferred cache writes on request/command termination and after each consumed message, inside one "cache.flush" span, so a Doctrine DBAL pool\'s deferred writes group under a single trace instead of orphaning at process shutdown')
+            ->defaultFalse()
             ->end()
             ->end()
             ->end()
@@ -879,7 +897,7 @@ final class FlowTelemetryBundle extends AbstractBundle
     }
 
     /**
-     * @param array{resource: array{detectors?: array{enabled?: bool, static?: array{cache?: array{enabled?: bool, path?: null|string}, os?: array{enabled?: bool}, host?: array{enabled?: bool}, service?: array{enabled?: bool}, deployment?: array{enabled?: bool}, git?: array{enabled?: bool, binary?: string, working_directory?: null|string}, environment?: array{enabled?: bool}}, dynamic?: array{process?: array{enabled?: bool}}}, custom?: array<string, mixed>}, clock_service_id?: null|string, framework_logger?: null|string, capture_framework_channels?: bool, channel_attribute_target?: 'scope'|'signal'|'both', runtime_mode?: 'auto'|'classic'|'worker', context_storage?: array{type?: string, service_id?: null|string}, propagator?: array{type?: string, service_id?: null|string}, exporters?: array<string, array<string, mixed>>, error_handlers?: array<string, array<string, mixed>>, tracer_provider?: array<string, mixed>, meter_provider?: array<string, mixed>, logger_provider?: array<string, mixed>, instrumentation?: array{http_kernel?: array{enabled?: bool, exclude_paths?: array<array{path: string, method?: null|string}>, context_propagation?: bool, trace_controller?: bool, trace_controller_resolution?: bool, trace_controller_arguments?: bool, trace_controller_argument_resolvers?: bool}, console?: array{enabled?: bool, exclude_commands?: array<string>}, messenger?: array{enabled?: bool, context_propagation?: bool, trace?: 'worker'|'handlers'|'both'|'none', link?: 'dispatcher'|'worker'|'both', metrics?: bool, metrics_duration_unit?: 's'|'ms'}, twig?: array{enabled?: bool, trace_templates?: bool, trace_blocks?: bool, trace_macros?: bool, exclude_templates?: array<string>}, http_client?: array{enabled?: bool, exclude_clients?: array<string>}, psr18_client?: array{enabled?: bool, exclude_clients?: array<string>}, dbal?: array{enabled?: bool, log_sql?: bool, max_sql_length?: int, exclude_connections?: array<string>}, cache?: array{enabled?: bool, exclude_pools?: array<string>}}, profiler?: array{enabled?: bool|null, capture_logs?: bool}, tracers?: array<string, array{version?: string, schema_url?: null|string, attributes?: array{scope?: array<string, mixed>, signal?: array<string, mixed>}}>, meters?: array<string, array{version?: string, schema_url?: null|string, attributes?: array{scope?: array<string, mixed>, signal?: array<string, mixed>}}>, loggers?: array<string, array{version?: string, schema_url?: null|string, attributes?: array{scope?: array<string, mixed>, signal?: array<string, mixed>}}>} $config
+     * @param array{resource: array{detectors?: array{enabled?: bool, static?: array{cache?: array{enabled?: bool, path?: null|string}, os?: array{enabled?: bool}, host?: array{enabled?: bool}, service?: array{enabled?: bool}, deployment?: array{enabled?: bool}, git?: array{enabled?: bool, binary?: string, working_directory?: null|string}, environment?: array{enabled?: bool}}, dynamic?: array{process?: array{enabled?: bool}}}, custom?: array<string, mixed>}, clock_service_id?: null|string, framework_logger?: null|string, capture_framework_channels?: bool, channel_attribute_target?: 'scope'|'signal'|'both', runtime_mode?: 'auto'|'classic'|'worker', context_storage?: array{type?: string, service_id?: null|string}, propagator?: array{type?: string, service_id?: null|string}, exporters?: array<string, array<string, mixed>>, error_handlers?: array<string, array<string, mixed>>, tracer_provider?: array<string, mixed>, meter_provider?: array<string, mixed>, logger_provider?: array<string, mixed>, instrumentation?: array{http_kernel?: array{enabled?: bool, exclude_paths?: array<array{path: string, method?: null|string}>, context_propagation?: bool, trace_controller?: bool, trace_controller_resolution?: bool, trace_controller_arguments?: bool, trace_controller_argument_resolvers?: bool}, console?: array{enabled?: bool, exclude_commands?: array<string>}, messenger?: array{enabled?: bool, context_propagation?: bool, trace?: bool, metrics?: bool}, twig?: array{enabled?: bool, trace_templates?: bool, trace_blocks?: bool, trace_macros?: bool, exclude_templates?: array<string>}, http_client?: array{enabled?: bool, exclude_clients?: array<string>}, psr18_client?: array{enabled?: bool, exclude_clients?: array<string>}, dbal?: array{enabled?: bool, max_sql_length?: int, collect_metrics?: bool, include_parameters?: bool, max_parameters?: int, max_parameter_length?: int, transaction_spans?: 'grouped'|'per_operation'|'off', exclude_connections?: array<string>, exclude_tables?: array<string>}, cache?: array{enabled?: bool, exclude_pools?: array<string>, flush_deferred?: bool}}, profiler?: array{enabled?: bool|null, capture_logs?: bool}, tracers?: array<string, array{version?: string, schema_url?: null|string, attributes?: array{scope?: array<string, mixed>, signal?: array<string, mixed>}}>, meters?: array<string, array{version?: string, schema_url?: null|string, attributes?: array{scope?: array<string, mixed>, signal?: array<string, mixed>}}>, loggers?: array<string, array{version?: string, schema_url?: null|string, attributes?: array{scope?: array<string, mixed>, signal?: array<string, mixed>}}>} $config
      */
     #[Override]
     public function loadExtension(array $config, ContainerConfigurator $container, ContainerBuilder $builder): void
@@ -2056,11 +2074,19 @@ final class FlowTelemetryBundle extends AbstractBundle
         $samplerServiceId = $this->buildSampler($samplerConfig, $builder);
         $errorHandlerRef = $this->resolveErrorHandlerReference($config['error_handler'] ?? 'default', $builder);
 
+        // Compose the configured sampler with tracing-suppression enforcement (the context-scoped
+        // OpenTelemetry key) so suppression takes precedence over the sampling strategy in use.
+        $suppressingSamplerServiceId = $samplerServiceId . '.suppressing';
+        $builder->setDefinition(
+            $suppressingSamplerServiceId,
+            new Definition(SuppressingSampler::class, [new Reference($samplerServiceId)]),
+        );
+
         $definition = new Definition(TracerProvider::class);
         $definition->setArgument(0, new Reference($processorServiceId));
         $definition->setArgument(1, new Reference('flow.telemetry.clock'));
         $definition->setArgument(2, new Reference('flow.telemetry.context_storage'));
-        $definition->setArgument(3, new Reference($samplerServiceId));
+        $definition->setArgument(3, new Reference($suppressingSamplerServiceId));
         $definition->setArgument('$errorHandler', $errorHandlerRef);
         $builder->setDefinition($providerServiceId, $definition);
 
@@ -2888,9 +2914,7 @@ final class FlowTelemetryBundle extends AbstractBundle
             }
             $builder->setAlias('flow.telemetry.context_storage', $customServiceId);
         } else {
-            $contextStorageDefinition = new Definition(MemoryContextStorage::class);
-            $contextStorageDefinition->addTag('kernel.reset', ['method' => 'reset']);
-            $builder->setDefinition('flow.telemetry.context_storage', $contextStorageDefinition);
+            $builder->setDefinition('flow.telemetry.context_storage', new Definition(MemoryContextStorage::class));
         }
 
         $runtimeMode = is_string($config['runtime_mode'] ?? null) ? $config['runtime_mode'] : 'auto';
@@ -2910,7 +2934,7 @@ final class FlowTelemetryBundle extends AbstractBundle
     }
 
     /**
-     * @param array{http_kernel?: array{enabled?: bool, exclude_routes?: array<string>, exclude_paths?: array<array{path: string, method?: null|string}>, context_propagation?: bool, trace_controller?: bool, trace_controller_resolution?: bool, trace_controller_arguments?: bool, trace_controller_argument_resolvers?: bool}, console?: array{enabled?: bool, exclude_commands?: array<string>}, messenger?: array{enabled?: bool, context_propagation?: bool, trace?: 'worker'|'handlers'|'both'|'none', link?: 'dispatcher'|'worker'|'both', metrics?: bool, metrics_duration_unit?: 's'|'ms'}, twig?: array{enabled?: bool, trace_templates?: bool, trace_blocks?: bool, trace_macros?: bool, exclude_templates?: array<string>}, http_client?: array{enabled?: bool, exclude_clients?: array<string>}, psr18_client?: array{enabled?: bool, exclude_clients?: array<string>}, dbal?: array{enabled?: bool, log_sql?: bool, max_sql_length?: int, exclude_connections?: array<string>}, cache?: array{enabled?: bool, exclude_pools?: array<string>}} $config
+     * @param array{http_kernel?: array{enabled?: bool, exclude_routes?: array<string>, exclude_paths?: array<array{path: string, method?: null|string}>, context_propagation?: bool, trace_controller?: bool, trace_controller_resolution?: bool, trace_controller_arguments?: bool, trace_controller_argument_resolvers?: bool}, console?: array{enabled?: bool, exclude_commands?: array<string>}, messenger?: array{enabled?: bool, context_propagation?: bool, trace?: bool, metrics?: bool}, twig?: array{enabled?: bool, trace_templates?: bool, trace_blocks?: bool, trace_macros?: bool, exclude_templates?: array<string>}, http_client?: array{enabled?: bool, exclude_clients?: array<string>}, psr18_client?: array{enabled?: bool, exclude_clients?: array<string>}, dbal?: array{enabled?: bool, max_sql_length?: int, collect_metrics?: bool, include_parameters?: bool, max_parameters?: int, max_parameter_length?: int, transaction_spans?: 'grouped'|'per_operation'|'off', exclude_connections?: array<string>, exclude_tables?: array<string>}, cache?: array{enabled?: bool, exclude_pools?: array<string>, flush_deferred?: bool}} $config
      */
     private function registerInstrumentation(array $config, ContainerConfigurator $container, ContainerBuilder $builder): void
     {
@@ -2955,13 +2979,25 @@ final class FlowTelemetryBundle extends AbstractBundle
         }
 
         $consoleConfig = $config['console'] ?? [];
+        $excludeCommands = $consoleConfig['exclude_commands'] ?? ['messenger:consume'];
 
         if ((bool) ($consoleConfig['enabled'] ?? false)) {
-            $builder->setParameter(
-                'flow.telemetry.console.exclude_commands',
-                $consoleConfig['exclude_commands'] ?? [],
-            );
+            $builder->setParameter('flow.telemetry.console.exclude_commands', $excludeCommands);
             $container->import(__DIR__ . '/Resources/config/instrumentation/console.php');
+        }
+
+        // Excluded commands are fully suppressed (the command and everything nested under it). Registered
+        // independently of console spans so worker suppression still applies when console tracing is off;
+        // an empty exclude list traces everything, including messenger:consume.
+        if ($excludeCommands !== []) {
+            $suppressionSubscriber = new Definition(CommandSuppressionSubscriber::class);
+            $suppressionSubscriber->setArgument(0, new Reference('flow.telemetry.context_storage'));
+            $suppressionSubscriber->setArgument(1, $excludeCommands);
+            $suppressionSubscriber->addTag('kernel.event_subscriber');
+            $builder->setDefinition(
+                'flow.telemetry.console.command_suppression_subscriber',
+                $suppressionSubscriber,
+            );
         }
 
         $messengerConfig = $config['messenger'] ?? [];
@@ -2975,27 +3011,13 @@ final class FlowTelemetryBundle extends AbstractBundle
 
             $container->import(__DIR__ . '/Resources/config/instrumentation/messenger.php');
 
-            $trace = $messengerConfig['trace'] ?? 'both';
-            $traceWorker = $trace === 'worker' || $trace === 'both';
-            $traceHandler = $trace === 'handlers' || $trace === 'both';
-
             $definition = $builder->getDefinition('flow.telemetry.messenger.middleware');
             $definition->setArgument(1, new Reference('flow.telemetry.context_storage'));
             $definition->setArgument(2, ($messengerConfig['context_propagation'] ?? true)
                 ? new Reference('flow.telemetry.propagator')
                 : null);
-            $definition->setArgument(3, $traceHandler);
-            $definition->setArgument(4, MessengerHandlerLink::from($messengerConfig['link'] ?? 'both'));
-            $definition->setArgument(5, ($messengerConfig['metrics'] ?? true) === true);
-            $definition->setArgument(6, MessengerMetricDurationUnit::from($messengerConfig['metrics_duration_unit'] ?? 's'));
-
-            // The cycle span (worker traced) and the poll suppression (worker not traced) are the two
-            // mutually exclusive strategies for keeping the transport poll from producing orphan spans.
-            if ($traceWorker) {
-                $builder->removeDefinition('flow.telemetry.messenger.worker_poll_suppression_subscriber');
-            } else {
-                $builder->removeDefinition('flow.telemetry.messenger.worker_receive_cycle_subscriber');
-            }
+            $definition->setArgument(3, ($messengerConfig['trace'] ?? true) === true);
+            $definition->setArgument(4, ($messengerConfig['metrics'] ?? true) === true);
         }
 
         $twigConfig = $config['twig'] ?? [];
@@ -3030,15 +3052,15 @@ final class FlowTelemetryBundle extends AbstractBundle
 
             $builder->setParameter(
                 'flow.telemetry.security.field.id_attribute',
-                ($idField['enabled'] ?? true) === true ? ($idField['attribute'] ?? 'user.id') : null,
+                ($idField['enabled'] ?? true) === true ? ($idField['attribute'] ?? SemConvAttributes::USER_ID) : null,
             );
             $builder->setParameter(
                 'flow.telemetry.security.field.roles_attribute',
-                ($rolesField['enabled'] ?? false) === true ? ($rolesField['attribute'] ?? 'user.roles') : null,
+                ($rolesField['enabled'] ?? false) === true ? ($rolesField['attribute'] ?? SemConvAttributes::USER_ROLES) : null,
             );
             $builder->setParameter(
                 'flow.telemetry.security.field.email_attribute',
-                ($emailField['enabled'] ?? false) === true ? ($emailField['attribute'] ?? 'user.email') : null,
+                ($emailField['enabled'] ?? false) === true ? ($emailField['attribute'] ?? SemConvAttributes::USER_EMAIL) : null,
             );
             $builder->setParameter(
                 'flow.telemetry.security.field.email_getter',
@@ -3447,7 +3469,7 @@ final class FlowTelemetryBundle extends AbstractBundle
     }
 
     /**
-     * @param array{http_kernel?: array{enabled?: bool, exclude_routes?: array<string>, exclude_paths?: array<array{path: string, method?: null|string}>, context_propagation?: bool, trace_controller?: bool, trace_controller_resolution?: bool, trace_controller_arguments?: bool, trace_controller_argument_resolvers?: bool}, console?: array{enabled?: bool, exclude_commands?: array<string>}, messenger?: array{enabled?: bool, context_propagation?: bool, trace?: 'worker'|'handlers'|'both'|'none', link?: 'dispatcher'|'worker'|'both', metrics?: bool, metrics_duration_unit?: 's'|'ms'}, twig?: array{enabled?: bool, trace_templates?: bool, trace_blocks?: bool, trace_macros?: bool, exclude_templates?: array<string>}, http_client?: array{enabled?: bool, exclude_clients?: array<string>}, psr18_client?: array{enabled?: bool, exclude_clients?: array<string>}, dbal?: array{enabled?: bool, log_sql?: bool, max_sql_length?: int, exclude_connections?: array<string>}, cache?: array{enabled?: bool, exclude_pools?: array<string>}} $config
+     * @param array{http_kernel?: array{enabled?: bool, exclude_routes?: array<string>, exclude_paths?: array<array{path: string, method?: null|string}>, context_propagation?: bool, trace_controller?: bool, trace_controller_resolution?: bool, trace_controller_arguments?: bool, trace_controller_argument_resolvers?: bool}, console?: array{enabled?: bool, exclude_commands?: array<string>}, messenger?: array{enabled?: bool, context_propagation?: bool, trace?: bool, metrics?: bool}, twig?: array{enabled?: bool, trace_templates?: bool, trace_blocks?: bool, trace_macros?: bool, exclude_templates?: array<string>}, http_client?: array{enabled?: bool, exclude_clients?: array<string>}, psr18_client?: array{enabled?: bool, exclude_clients?: array<string>}, dbal?: array{enabled?: bool, max_sql_length?: int, collect_metrics?: bool, include_parameters?: bool, max_parameters?: int, max_parameter_length?: int, transaction_spans?: 'grouped'|'per_operation'|'off', exclude_connections?: array<string>, exclude_tables?: array<string>}, cache?: array{enabled?: bool, exclude_pools?: array<string>, flush_deferred?: bool}} $config
      */
     private function registerParameterOnlyInstrumentation(array $config, ContainerBuilder $builder): void
     {
@@ -3467,13 +3489,19 @@ final class FlowTelemetryBundle extends AbstractBundle
 
         $dbalConfig = $config['dbal'] ?? [];
         $builder->setParameter('flow.telemetry.dbal.enabled', $dbalConfig['enabled'] ?? false);
-        $builder->setParameter('flow.telemetry.dbal.log_sql', $dbalConfig['log_sql'] ?? true);
         $builder->setParameter('flow.telemetry.dbal.max_sql_length', $dbalConfig['max_sql_length'] ?? 1000);
+        $builder->setParameter('flow.telemetry.dbal.collect_metrics', $dbalConfig['collect_metrics'] ?? true);
+        $builder->setParameter('flow.telemetry.dbal.include_parameters', $dbalConfig['include_parameters'] ?? false);
+        $builder->setParameter('flow.telemetry.dbal.max_parameters', $dbalConfig['max_parameters'] ?? 10);
+        $builder->setParameter('flow.telemetry.dbal.max_parameter_length', $dbalConfig['max_parameter_length'] ?? 100);
+        $builder->setParameter('flow.telemetry.dbal.transaction_spans', $dbalConfig['transaction_spans'] ?? 'grouped');
         $builder->setParameter('flow.telemetry.dbal.exclude_connections', $dbalConfig['exclude_connections'] ?? []);
+        $builder->setParameter('flow.telemetry.dbal.exclude_tables', $dbalConfig['exclude_tables'] ?? []);
 
         $cacheConfig = $config['cache'] ?? [];
         $builder->setParameter('flow.telemetry.cache.enabled', $cacheConfig['enabled'] ?? false);
         $builder->setParameter('flow.telemetry.cache.exclude_pools', $cacheConfig['exclude_pools'] ?? []);
+        $builder->setParameter('flow.telemetry.cache.flush_deferred', $cacheConfig['flush_deferred'] ?? false);
     }
 
     /**
