@@ -11,7 +11,8 @@ use Symfony\Component\Console\Event\ConsoleCommandEvent;
 use Symfony\Component\Console\Event\ConsoleTerminateEvent;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 
-use function preg_match;
+use function array_map;
+use function array_pop;
 
 /**
  * Suppresses tracing for the entire execution of the configured commands (long-running worker commands),
@@ -23,6 +24,10 @@ use function preg_match;
  * The flag is attached above ConsoleSpanSubscriber's COMMAND priority (10000) so the command's own console
  * span is created non-recording, and detached below its TERMINATE priority (-10000) so that span completes
  * first.
+ *
+ * Scopes are stacked per COMMAND/TERMINATE pair (Symfony dispatches them balanced, also for commands nested
+ * via Application::run()), so a nested command's TERMINATE detaches its own entry instead of tearing down
+ * the suppression of the enclosing command.
  */
 final class CommandSuppressionSubscriber implements EventSubscriberInterface
 {
@@ -30,15 +35,26 @@ final class CommandSuppressionSubscriber implements EventSubscriberInterface
 
     private const CLEAR_PRIORITY = -20000;
 
-    private ?Scope $scope = null;
+    /** @var array<CommandExclusionRule> */
+    private readonly array $suppressRules;
+
+    /**
+     * @var array<null|Scope>
+     */
+    private array $scopes = [];
 
     /**
      * @param array<string> $suppressCommands
      */
     public function __construct(
         private readonly ContextStorage $contextStorage,
-        private readonly array $suppressCommands,
-    ) {}
+        array $suppressCommands,
+    ) {
+        $this->suppressRules = array_map(
+            static fn(string $pattern): CommandExclusionRule => new CommandExclusionRule($pattern),
+            $suppressCommands,
+        );
+    }
 
     public static function getSubscribedEvents(): array
     {
@@ -53,35 +69,31 @@ final class CommandSuppressionSubscriber implements EventSubscriberInterface
         $name = $event->getCommand()?->getName();
 
         if ($name !== null && $this->shouldSuppress($name)) {
-            $this->scope = $this->contextStorage->attach($this->contextStorage->current()->withSuppressedTracing());
+            $this->scopes[] = $this->contextStorage->attach($this->contextStorage->current()->withSuppressedTracing());
+
+            return;
         }
+
+        $this->scopes[] = null;
     }
 
     public function onTerminate(ConsoleTerminateEvent $event): void
     {
-        $this->scope?->detach();
-        $this->scope = null;
+        if ($this->scopes === []) {
+            return;
+        }
+
+        array_pop($this->scopes)?->detach();
     }
 
     private function shouldSuppress(string $commandName): bool
     {
-        foreach ($this->suppressCommands as $pattern) {
-            if ($this->matchesPattern($commandName, $pattern)) {
+        foreach ($this->suppressRules as $rule) {
+            if ($rule->matches($commandName)) {
                 return true;
             }
         }
 
         return false;
-    }
-
-    private function matchesPattern(string $command, string $pattern): bool
-    {
-        $result = @preg_match($pattern, $command);
-
-        if ($result !== false) {
-            return (bool) $result;
-        }
-
-        return $command === $pattern;
     }
 }
