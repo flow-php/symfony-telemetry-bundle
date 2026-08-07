@@ -8,6 +8,7 @@ use Flow\Bridge\Symfony\TelemetryBundle\DependencyInjection\Compiler\InterfaceAl
 use Flow\Bridge\Symfony\TelemetryBundle\Instrumentation\Cache\TraceableCacheAdapter;
 use Flow\Bridge\Symfony\TelemetryBundle\Tests\Fixtures\Cache\ArrayCacheAdapter;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\DependencyInjection\Alias;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
@@ -17,6 +18,7 @@ use Symfony\Contracts\Cache\NamespacedPoolInterface;
 #[CoversClass(InterfaceAliasRepointer::class)]
 final class InterfaceAliasRepointerTest extends TestCase
 {
+    #[RequiresMethod(NamespacedPoolInterface::class, 'withSubNamespace')]
     public function test_alias_the_decorator_cannot_satisfy_is_pointed_at_the_inner_service(): void
     {
         $container = new ContainerBuilder();
@@ -25,7 +27,7 @@ final class InterfaceAliasRepointerTest extends TestCase
 
         (new InterfaceAliasRepointer($container))->repoint(
             'cache.app',
-            'cache.app.flow_telemetry',
+            'cache.app.flow_telemetry.inner',
             TraceableCacheAdapter::class,
         );
 
@@ -43,13 +45,14 @@ final class InterfaceAliasRepointerTest extends TestCase
 
         (new InterfaceAliasRepointer($container))->repoint(
             'cache.app',
-            'cache.app.flow_telemetry',
+            'cache.app.flow_telemetry.inner',
             TraceableCacheAdapter::class,
         );
 
         static::assertSame('cache.app', (string) $container->getAlias(CacheInterface::class));
     }
 
+    #[RequiresMethod(NamespacedPoolInterface::class, 'withSubNamespace')]
     public function test_alias_pointing_at_another_service_is_left_alone(): void
     {
         $container = new ContainerBuilder();
@@ -58,7 +61,7 @@ final class InterfaceAliasRepointerTest extends TestCase
 
         (new InterfaceAliasRepointer($container))->repoint(
             'cache.app',
-            'cache.app.flow_telemetry',
+            'cache.app.flow_telemetry.inner',
             TraceableCacheAdapter::class,
         );
 
@@ -73,13 +76,14 @@ final class InterfaceAliasRepointerTest extends TestCase
 
         (new InterfaceAliasRepointer($container))->repoint(
             'cache.app',
-            'cache.app.flow_telemetry',
+            'cache.app.flow_telemetry.inner',
             TraceableCacheAdapter::class,
         );
 
         static::assertSame('cache.app', (string) $container->getAlias('cache.app.alias'));
     }
 
+    #[RequiresMethod(NamespacedPoolInterface::class, 'withSubNamespace')]
     public function test_public_visibility_is_preserved(): void
     {
         $container = new ContainerBuilder();
@@ -88,13 +92,14 @@ final class InterfaceAliasRepointerTest extends TestCase
 
         (new InterfaceAliasRepointer($container))->repoint(
             'cache.app',
-            'cache.app.flow_telemetry',
+            'cache.app.flow_telemetry.inner',
             TraceableCacheAdapter::class,
         );
 
         static::assertTrue($container->getAlias(NamespacedPoolInterface::class)->isPublic());
     }
 
+    #[RequiresMethod(NamespacedPoolInterface::class, 'withSubNamespace')]
     public function test_private_visibility_is_preserved(): void
     {
         $container = new ContainerBuilder();
@@ -103,13 +108,14 @@ final class InterfaceAliasRepointerTest extends TestCase
 
         (new InterfaceAliasRepointer($container))->repoint(
             'cache.app',
-            'cache.app.flow_telemetry',
+            'cache.app.flow_telemetry.inner',
             TraceableCacheAdapter::class,
         );
 
         static::assertFalse($container->getAlias(NamespacedPoolInterface::class)->isPublic());
     }
 
+    #[RequiresMethod(NamespacedPoolInterface::class, 'withSubNamespace')]
     public function test_deprecation_is_preserved(): void
     {
         $container = new ContainerBuilder();
@@ -122,7 +128,7 @@ final class InterfaceAliasRepointerTest extends TestCase
 
         (new InterfaceAliasRepointer($container))->repoint(
             'cache.app',
-            'cache.app.flow_telemetry',
+            'cache.app.flow_telemetry.inner',
             TraceableCacheAdapter::class,
         );
 
